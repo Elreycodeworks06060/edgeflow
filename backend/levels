@@ -1,0 +1,225 @@
+import sqlite3
+import pandas as pd
+import pytz
+from datetime import datetime, timedelta
+
+DB_PATH = "../data/edgeflow.db"
+ET = pytz.timezone('America/New_York')
+
+def get_minute_data(ticker):
+    conn = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query('''
+        SELECT datetime, open, high, low, close, volume
+        FROM minute_bars WHERE ticker = ?
+        ORDER BY datetime ASC
+    ''', conn, params=(ticker,))
+    conn.close()
+    df['datetime'] = pd.to_datetime(df['datetime'], utc=True)
+    df['datetime'] = df['datetime'].dt.tz_convert(ET)
+    df = df.set_index('datetime')
+    return df
+
+def get_daily_data(ticker):
+    conn = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query('''
+        SELECT date, open, high, low, close, volume
+        FROM daily_bars WHERE ticker = ?
+        ORDER BY date ASC
+    ''', conn, params=(ticker,))
+    conn.close()
+    df['date'] = pd.to_datetime(df['date'])
+    df = df.set_index('date')
+    return df
+
+def calculate_levels(ticker):
+    """
+    Calculate key levels for every trading day:
+    - Previous Day High (PDH)
+    - Previous Day Low (PDL)
+    - Previous Day Close (PDC)
+    - True Day High (overnight included)
+    - True Day Low (overnight included)
+    - True Day Range
+    - Session VWAP
+    - VWAP direction (price above or below VWAP at IB completion)
+    """
+    print(f"\nCalculating key levels for {ticker}...")
+
+    df = get_minute_data(ticker)
+    daily = get_daily_data(ticker)
+
+    # Regular trading hours only
+    rth = df.between_time('09:30', '16:00')
+    trading_days = rth.index.normalize().unique()
+
+    results = []
+
+    for i, day in enumerate(trading_days):
+        if i == 0:
+            continue  # Need previous day
+
+        day_data = rth[rth.index.date == day.date()]
+        if len(day_data) == 0:
+            continue
+
+        # Previous day RTH data
+        prev_day = trading_days[i - 1]
+        prev_data = rth[rth.index.date == prev_day.date()]
+        if len(prev_data) == 0:
+            continue
+
+        # Previous Day High, Low, Close
+        pdh = float(prev_data['high'].max())
+        pdl = float(prev_data['low'].min())
+        pdc = float(prev_data['close'].iloc[-1])
+
+        # True Day — includes overnight session (use all data not just RTH)
+        all_day = df[df.index.date == day.date()]
+        true_high = float(all_day['high'].max()) if len(all_day) > 0 else pdh
+        true_low = float(all_day['low'].min()) if len(all_day) > 0 else pdl
+        true_range = true_high - true_low
+
+        # Gap calculation
+        today_open = float(day_data['open'].iloc[0])
+        gap_pts = today_open - pdc
+        gap_pct = (gap_pts / pdc) * 100
+
+        # Session VWAP — calculated from open to current
+        day_data = day_data.copy()
+        day_data['typical_price'] = (day_data['high'] + day_data['low'] + day_data['close']) / 3
+        day_data['tp_vol'] = day_data['typical_price'] * day_data['volume']
+        day_data['cum_tp_vol'] = day_data['tp_vol'].cumsum()
+        day_data['cum_vol'] = day_data['volume'].cumsum()
+        day_data['vwap'] = day_data['cum_tp_vol'] / day_data['cum_vol']
+
+        # VWAP at IB completion (10:30 AM)
+        ib_data = day_data.between_time('09:30', '10:29')
+        vwap_at_ib = float(ib_data['vwap'].iloc[-1]) if len(ib_data) > 0 else None
+
+        # Price vs VWAP at IB completion
+        ib_close = float(ib_data['close'].iloc[-1]) if len(ib_data) > 0 else None
+        price_above_vwap = bool(ib_close > vwap_at_ib) if vwap_at_ib and ib_close else None
+
+        # PDH/PDL proximity — is IB high/low near previous day levels?
+        ib_high = float(ib_data['high'].max()) if len(ib_data) > 0 else None
+        ib_low = float(ib_data['low'].min()) if len(ib_data) > 0 else None
+
+        pdh_nearby = bool(abs(ib_high - pdh) < (true_range * 0.1)) if ib_high else False
+        pdl_nearby = bool(abs(ib_low - pdl) < (true_range * 0.1)) if ib_low else False
+
+        results.append({
+            'date': str(day.date()),
+            'ticker': ticker,
+            'day_of_week': day.day_name(),
+            'pdh': pdh,
+            'pdl': pdl,
+            'pdc': pdc,
+            'true_high': true_high,
+            'true_low': true_low,
+            'true_range': true_range,
+            'gap_pts': round(gap_pts, 2),
+            'gap_pct': round(gap_pct, 4),
+            'vwap_at_ib': vwap_at_ib,
+            'price_above_vwap': price_above_vwap,
+            'pdh_nearby': pdh_nearby,
+            'pdl_nearby': pdl_nearby,
+            'ib_high': ib_high,
+            'ib_low': ib_low,
+        })
+
+    df_results = pd.DataFrame(results)
+    print(f"✅ Calculated {len(df_results)} days of key levels for {ticker}")
+    return df_results
+
+def store_levels(df, ticker):
+    """Store calculated levels in database"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS key_levels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT,
+            ticker TEXT,
+            day_of_week TEXT,
+            pdh REAL,
+            pdl REAL,
+            pdc REAL,
+            true_high REAL,
+            true_low REAL,
+            true_range REAL,
+            gap_pts REAL,
+            gap_pct REAL,
+            vwap_at_ib REAL,
+            price_above_vwap INTEGER,
+            pdh_nearby INTEGER,
+            pdl_nearby INTEGER,
+            ib_high REAL,
+            ib_low REAL,
+            UNIQUE(date, ticker)
+        )
+    ''')
+
+    stored = 0
+    for _, row in df.iterrows():
+        try:
+            conn.execute('''
+                INSERT OR IGNORE INTO key_levels (
+                    date, ticker, day_of_week, pdh, pdl, pdc,
+                    true_high, true_low, true_range, gap_pts, gap_pct,
+                    vwap_at_ib, price_above_vwap, pdh_nearby, pdl_nearby,
+                    ib_high, ib_low
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                row['date'], row['ticker'], row['day_of_week'],
+                row['pdh'], row['pdl'], row['pdc'],
+                row['true_high'], row['true_low'], row['true_range'],
+                row['gap_pts'], row['gap_pct'],
+                row['vwap_at_ib'], row['price_above_vwap'],
+                row['pdh_nearby'], row['pdl_nearby'],
+                row['ib_high'], row['ib_low']
+            ))
+            stored += 1
+        except Exception as e:
+            pass
+
+    conn.commit()
+    conn.close()
+    print(f"✅ Stored {stored} level records for {ticker}")
+
+def get_levels_for_date(ticker, date_str):
+    """Get key levels for a specific date"""
+    conn = sqlite3.connect(DB_PATH)
+    result = conn.execute('''
+        SELECT * FROM key_levels
+        WHERE ticker = ? AND date = ?
+    ''', (ticker, date_str)).fetchone()
+    conn.close()
+
+    if result:
+        cols = ['id', 'date', 'ticker', 'day_of_week', 'pdh', 'pdl', 'pdc',
+                'true_high', 'true_low', 'true_range', 'gap_pts', 'gap_pct',
+                'vwap_at_ib', 'price_above_vwap', 'pdh_nearby', 'pdl_nearby',
+                'ib_high', 'ib_low']
+        return dict(zip(cols, result))
+    return None
+
+def print_sample(df, ticker):
+    """Print a sample of the levels data"""
+    print(f"\n--- SAMPLE KEY LEVELS — {ticker} ---")
+    print(f"{'Date':<12} {'PDH':>8} {'PDL':>8} {'PDC':>8} {'TrueRange':>10} {'Gap%':>7} {'AboveVWAP':>10} {'PDH Near':>9}")
+    print("-" * 80)
+    for _, row in df.tail(10).iterrows():
+        vwap_str = "YES" if row['price_above_vwap'] else "NO"
+        pdh_str = "YES" if row['pdh_nearby'] else "NO"
+        print(f"{row['date']:<12} {row['pdh']:>8.2f} {row['pdl']:>8.2f} {row['pdc']:>8.2f} {row['true_range']:>10.2f} {row['gap_pct']:>7.3f} {vwap_str:>10} {pdh_str:>9}")
+
+if __name__ == "__main__":
+    print("=" * 55)
+    print("EDGEFLOW — Key Levels Calculator")
+    print("=" * 55)
+
+    for ticker in ["ES", "NQ"]:
+        df = calculate_levels(ticker)
+        store_levels(df, ticker)
+        print_sample(df, ticker)
+
+    print("\n✅ All key levels calculated and stored")

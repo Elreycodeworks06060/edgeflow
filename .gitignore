@@ -1,0 +1,24 @@
+﻿# Data & database
+data/
+*.db
+*.csv
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Node / frontend
+node_modules/
+dist/
+
+# Secrets & keys
+*.env
+.env
+*.key
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+.vscode/

@@ -1,0 +1,248 @@
+//@version=6
+indicator("EdgeFlow ORB Strategy", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// ─── INPUTS ───────────────────────────────────────────────────────────────────
+var g_orb = "ORB Settings"
+start_date      = input.time(timestamp("2024-01-01"), "Start Date", group=g_orb)
+orb_start_hour  = input.int(9,  "ORB Start Hour (ET)",   minval=0, maxval=23, group=g_orb)
+orb_start_min   = input.int(30, "ORB Start Minute (ET)", minval=0, maxval=59, group=g_orb)
+orb_end_hour    = input.int(9,  "ORB End Hour (ET)",     minval=0, maxval=23, group=g_orb)
+orb_end_min     = input.int(44, "ORB End Minute (ET)",   minval=0, maxval=59, group=g_orb)
+signal_end_hour = input.int(11, "Signal Window End Hour", minval=0, maxval=23, group=g_orb)
+min_range_pts   = input.float(8.0, "Min ORB Range (pts)", minval=0, group=g_orb)
+contracts       = input.int(1, "Contracts", minval=1, maxval=10, group=g_orb)
+multiplier      = input.float(50.0, "Point Multiplier ($)", minval=1, group=g_orb)
+
+var g_vis = "Visual Settings"
+show_all        = input.bool(true,  "Show All Signals",        group=g_vis)
+show_orb_box    = input.bool(true,  "Show ORB Range Box",      group=g_vis)
+show_targets    = input.bool(true,  "Show Target Lines",        group=g_vis)
+show_stop       = input.bool(true,  "Show Stop Line",           group=g_vis)
+show_labels     = input.bool(true,  "Show P&L Labels",          group=g_vis)
+box_opacity     = input.int(85, "Box Opacity", minval=0, maxval=100, group=g_vis)
+
+// ─── COLORS ───────────────────────────────────────────────────────────────────
+color_long_strong   = color.new(color.green, 0)
+color_long_weak     = color.new(color.green, 60)
+color_short_strong  = color.new(color.red, 0)
+color_short_weak    = color.new(color.red, 60)
+color_stop          = color.new(color.red, 30)
+color_target1       = color.new(color.lime, 40)
+color_target2       = color.new(color.lime, 0)
+color_box_long      = color.new(color.green, box_opacity)
+color_box_short     = color.new(color.red, box_opacity)
+color_box_neutral   = color.new(color.gray, box_opacity)
+
+// ─── SESSION DETECTION ────────────────────────────────────────────────────────
+et_offset = -4 * 60  // EDT offset in minutes (use -5 for EST winter)
+
+is_orb_candle = (hour * 60 + minute) >= (orb_start_hour * 60 + orb_start_min) and
+                (hour * 60 + minute) <= (orb_end_hour * 60 + orb_end_min)
+
+is_signal_window = (hour * 60 + minute) > (orb_end_hour * 60 + orb_end_min) and
+                   (hour * 60 + minute) <= (signal_end_hour * 60)
+
+is_new_day = dayofweek != dayofweek[1] or (hour == orb_start_hour and minute == orb_start_min and minute[1] != orb_start_min)
+
+// Skip Wednesdays
+is_wednesday = dayofweek == dayofweek.wednesday
+
+// ─── STATE VARIABLES ─────────────────────────────────────────────────────────
+var float orb_high = na
+var float orb_low  = na
+var int   orb_bar_start = na
+var bool  signal_fired = false
+var float day_gap_pct = na
+var box   orb_box = na
+
+// ─── ORB RANGE CALCULATION ────────────────────────────────────────────────────
+if is_new_day and not is_wednesday
+    orb_high := high
+    orb_low  := low
+    orb_bar_start := bar_index
+    signal_fired := false
+
+if is_orb_candle and not is_wednesday and not is_new_day
+    orb_high := math.max(orb_high, high)
+    orb_low  := math.min(orb_low, low)
+
+// Draw ORB box at end of ORB period
+if show_orb_box and not is_wednesday and
+   hour * 60 + minute == orb_end_hour * 60 + orb_end_min and
+   not na(orb_high) and not na(orb_low) and
+   time >= start_date
+    orb_range = orb_high - orb_low
+    box_color = orb_range >= min_range_pts ? color_box_neutral : color.new(color.gray, 95)
+    orb_box := box.new(
+         left=orb_bar_start,
+         top=orb_high,
+         right=bar_index + 20,
+         bottom=orb_low,
+         border_color=color.new(color.gray, 50),
+         border_width=1,
+         bgcolor=box_color
+    )
+
+// ─── CONFLUENCE SCORING ───────────────────────────────────────────────────────
+f_score(direction) =>
+    score = 0.0
+
+    // Gap direction
+    prev_close = close[1]
+    today_open = open
+    gap_pct = (today_open - prev_close) / prev_close * 100
+
+    if direction == 1 and gap_pct < -0.1  // Long + gap down
+        score += 2
+    else if direction == -1 and gap_pct > 0.1  // Short + gap up
+        score += 2
+    else
+        score += 0.5
+
+    // VWAP approximation (using 20-period VWAP)
+    vwap_val = ta.vwap(hlc3)
+    if direction == 1 and close > vwap_val
+        score += 1
+    else if direction == -1 and close < vwap_val
+        score += 1
+
+    // Day of week bonus
+    if dayofweek == dayofweek.tuesday
+        score += 0.5
+
+    // Range size bonus
+    orb_range = orb_high - orb_low
+    if orb_range > min_range_pts * 1.5
+        score += 0.5
+
+    score
+
+// ─── SIGNAL DETECTION ────────────────────────────────────────────────────────
+orb_range = orb_high - orb_low
+
+long_signal  = is_signal_window and not signal_fired and not is_wednesday and
+               not na(orb_high) and not na(orb_low) and
+               orb_range >= min_range_pts and
+               close > orb_high and
+               time >= start_date
+
+short_signal = is_signal_window and not signal_fired and not is_wednesday and
+               not na(orb_high) and not na(orb_low) and
+               orb_range >= min_range_pts and
+               close < orb_low and
+               time >= start_date
+
+// ─── DRAW SIGNALS ────────────────────────────────────────────────────────────
+if long_signal
+    score = f_score(1)
+    is_aplus = score >= 3
+
+    if show_all or is_aplus
+        signal_fired := true
+
+        entry   = orb_high
+        stop    = orb_low
+        target1 = entry + orb_range * 0.5
+        target2 = entry + orb_range * 1.0
+
+        sig_color = is_aplus ? color_long_strong : color_long_weak
+
+        // Entry arrow
+        label.new(bar_index, low, "▲",
+             style=label.style_label_up,
+             color=sig_color,
+             textcolor=color.white,
+             size=size.normal)
+
+        // Score label
+        if show_labels
+            pnl_t1_pts = target1 - entry
+            pnl_t2_pts = target2 - entry
+            pnl_t1_usd = pnl_t1_pts * multiplier * contracts * 0.5
+            pnl_t2_usd = pnl_t2_pts * multiplier * contracts * 0.5
+            total_usd   = pnl_t1_usd + pnl_t2_usd
+            stop_pts    = entry - stop
+            stop_usd    = stop_pts * multiplier * contracts
+            label_txt   = "LONG  Score:" + str.tostring(score, "#.#") + (is_aplus ? " ✓" : "") +
+                         "\nEntry: "  + str.tostring(entry,   "#.##") +
+                         "\nStop:  "  + str.tostring(stop,    "#.##") + " (-" + str.tostring(stop_pts, "#.##") + "pts / -$" + str.tostring(stop_usd, "#") + ")" +
+                         "\nT1:    "  + str.tostring(target1, "#.##") + " (+" + str.tostring(pnl_t1_pts, "#.##") + "pts / +$" + str.tostring(pnl_t1_usd, "#") + ")" +
+                         "\nT2:    "  + str.tostring(target2, "#.##") + " (+" + str.tostring(pnl_t2_pts, "#.##") + "pts / +$" + str.tostring(pnl_t2_usd, "#") + ")" +
+                         "\nMax:   +$" + str.tostring(total_usd, "#")
+            label.new(bar_index, high + orb_range * 0.3, label_txt,
+                 style=label.style_label_left,
+                 color=color.new(color.black, 20),
+                 textcolor=sig_color,
+                 size=size.small)
+
+        // Stop line
+        if show_stop
+            line.new(bar_index, stop, bar_index + 50, stop,
+                 color=color_stop, width=1, style=line.style_dashed)
+
+        // Target lines
+        if show_targets
+            line.new(bar_index, target1, bar_index + 50, target1,
+                 color=color_target1, width=1, style=line.style_dashed)
+            line.new(bar_index, target2, bar_index + 50, target2,
+                 color=color_target2, width=2, style=line.style_solid)
+
+if short_signal
+    score = f_score(-1)
+    is_aplus = score >= 3
+
+    if show_all or is_aplus
+        signal_fired := true
+
+        entry   = orb_low
+        stop    = orb_high
+        target1 = entry - orb_range * 0.5
+        target2 = entry - orb_range * 1.0
+
+        sig_color = is_aplus ? color_short_strong : color_short_weak
+
+        // Entry arrow
+        label.new(bar_index, high, "▼",
+             style=label.style_label_down,
+             color=sig_color,
+             textcolor=color.white,
+             size=size.normal)
+
+        // Score label
+        if show_labels
+            pnl_t1_pts = entry - target1
+            pnl_t2_pts = entry - target2
+            pnl_t1_usd = pnl_t1_pts * multiplier * contracts * 0.5
+            pnl_t2_usd = pnl_t2_pts * multiplier * contracts * 0.5
+            total_usd   = pnl_t1_usd + pnl_t2_usd
+            stop_pts    = stop - entry
+            stop_usd    = stop_pts * multiplier * contracts
+            label_txt   = "SHORT  Score:" + str.tostring(score, "#.#") + (is_aplus ? " ✓" : "") +
+                         "\nEntry: "  + str.tostring(entry,   "#.##") +
+                         "\nStop:  "  + str.tostring(stop,    "#.##") + " (-" + str.tostring(stop_pts, "#.##") + "pts / -$" + str.tostring(stop_usd, "#") + ")" +
+                         "\nT1:    "  + str.tostring(target1, "#.##") + " (+" + str.tostring(pnl_t1_pts, "#.##") + "pts / +$" + str.tostring(pnl_t1_usd, "#") + ")" +
+                         "\nT2:    "  + str.tostring(target2, "#.##") + " (+" + str.tostring(pnl_t2_pts, "#.##") + "pts / +$" + str.tostring(pnl_t2_usd, "#") + ")" +
+                         "\nMax:   +$" + str.tostring(total_usd, "#")
+            label.new(bar_index, low - orb_range * 0.3, label_txt,
+                 style=label.style_label_left,
+                 color=color.new(color.black, 20),
+                 textcolor=sig_color,
+                 size=size.small)
+
+        // Stop line
+        if show_stop
+            line.new(bar_index, stop, bar_index + 50, stop,
+                 color=color_stop, width=1, style=line.style_dashed)
+
+        // Target lines
+        if show_targets
+            line.new(bar_index, target1, bar_index + 50, target1,
+                 color=color_target1, width=1, style=line.style_dashed)
+            line.new(bar_index, target2, bar_index + 50, target2,
+                 color=color_target2, width=2, style=line.style_solid)
+
+// ─── ORB LEVELS ON CHART ─────────────────────────────────────────────────────
+plot(not na(orb_high) and not is_wednesday ? orb_high : na,
+     "ORB High", color=color.new(color.gray, 50), style=plot.style_linebr, linewidth=1)
+plot(not na(orb_low) and not is_wednesday ? orb_low : na,
+     "ORB Low",  color=color.new(color.gray, 50), style=plot.style_linebr, linewidth=1)
