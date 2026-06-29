@@ -239,6 +239,19 @@ def algo_scan():
     signals = scan_for_signals()
     return {"signals": signals, "count": len(signals)}
 
+@app.get("/signals/latest")
+def signals_latest():
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT * FROM signals ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+    if row is None:
+        return {"signal": None}
+    cols = ["id", "timestamp", "strategy", "ticker", "direction",
+            "entry", "stop", "target", "confluence_score", "confluence_factors", "status"]
+    return {"signal": dict(zip(cols, row))}
+
 @app.get("/trades/log")
 def trade_log():
     from webhook import get_trade_log

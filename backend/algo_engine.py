@@ -413,11 +413,16 @@ def log_signal(signal):
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp TEXT, strategy TEXT, ticker TEXT, direction TEXT,
             entry REAL, stop REAL, target REAL, confluence_score REAL,
-            confluence_factors TEXT, status TEXT DEFAULT 'pending'
+            confluence_factors TEXT, status TEXT DEFAULT 'pending',
+            UNIQUE(ticker, timestamp, direction)
         )
     ''')
     conn.execute('''
-        INSERT INTO signals (timestamp, strategy, ticker, direction, entry, stop,
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_signals_unique
+        ON signals(ticker, timestamp, direction)
+    ''')
+    conn.execute('''
+        INSERT OR IGNORE INTO signals (timestamp, strategy, ticker, direction, entry, stop,
         target, confluence_score, confluence_factors)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (
