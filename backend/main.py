@@ -419,6 +419,104 @@ def daily_report(ticker: str):
         }
     }
 
+@app.get("/backtest/wednesday/ES")
+def backtest_wednesday_es():
+    df = get_minute_data('ES')
+    df = df.between_time('09:30', '16:00')
+    trading_days = df.index.normalize().unique()
+    wednesdays   = [d for d in trading_days if d.day_name() == 'Wednesday']
+
+    results = []
+    for day in wednesdays:
+        day_data = df[df.index.date == day.date()]
+        orb_data = day_data.between_time('09:30', '09:44')
+        if len(orb_data) < 5:
+            continue
+        orb_high  = float(orb_data['high'].max())
+        orb_low   = float(orb_data['low'].min())
+        orb_range = orb_high - orb_low
+        if orb_range < 8:
+            continue
+
+        # Find first breakout in signal window 9:45–11:00
+        signal_bars = day_data.between_time('09:45', '11:00')
+        direction, entry = None, None
+        for _, row in signal_bars.iterrows():
+            if row['high'] > orb_high:
+                direction, entry = 'LONG',  orb_high; break
+            if row['low']  < orb_low:
+                direction, entry = 'SHORT', orb_low;  break
+
+        if not direction:
+            continue
+
+        stop    = round(entry - orb_range * 0.5, 2) if direction == 'LONG' else round(entry + orb_range * 0.5, 2)
+        target1 = round(entry + orb_range,        2) if direction == 'LONG' else round(entry - orb_range,        2)
+
+        # Simulate Scenario B: C1 exits at T1, C2 exits at EOD; stop exits both
+        all_bars  = day_data.between_time('09:45', '15:55')
+        eod_close = float(all_bars['close'].iloc[-1]) if len(all_bars) > 0 else entry
+        stop_hit  = False
+        t1_hit    = False
+
+        for _, row in all_bars.iterrows():
+            if direction == 'LONG':
+                if not t1_hit and row['high'] >= target1:
+                    t1_hit = True
+                elif not t1_hit and row['low'] <= stop:
+                    stop_hit = True; break
+            else:
+                if not t1_hit and row['low'] <= target1:
+                    t1_hit = True
+                elif not t1_hit and row['high'] >= stop:
+                    stop_hit = True; break
+
+        if stop_hit:
+            pnl    = (stop - entry) * 2 * 50 if direction == 'LONG' else (entry - stop) * 2 * 50
+            result = 'loss'
+        elif t1_hit:
+            c1 = (target1 - entry) * 50    if direction == 'LONG' else (entry - target1) * 50
+            c2 = (eod_close - entry) * 50  if direction == 'LONG' else (entry - eod_close) * 50
+            pnl    = round(c1 + c2, 2)
+            result = 'win' if pnl > 0 else 'loss'
+        else:
+            pnl    = (eod_close - entry) * 2 * 50 if direction == 'LONG' else (entry - eod_close) * 2 * 50
+            result = 'win' if pnl > 0 else 'loss'
+
+        results.append({
+            'date':      str(day.date()),
+            'day_of_week': 'Wednesday',
+            'direction': direction,
+            'entry':     round(entry, 2),
+            'stop':      round(stop, 2),
+            'target1':   round(target1, 2),
+            'orb_high':  round(orb_high, 2),
+            'orb_low':   round(orb_low,  2),
+            'orb_range': round(orb_range, 2),
+            'pnl':       round(pnl, 2),
+            'result':    result,
+            't1_hit':    t1_hit,
+            'stop_hit':  stop_hit,
+            'eod_close': round(eod_close, 2),
+        })
+
+    if not results:
+        return {'trades': [], 'summary': None}
+
+    wins     = [r for r in results if r['result'] == 'win']
+    total_pnl = sum(r['pnl'] for r in results)
+    return {
+        'trades': results,
+        'summary': {
+            'total':    len(results),
+            'wins':     len(wins),
+            'losses':   len(results) - len(wins),
+            'winRate':  round(len(wins) / len(results) * 100, 1),
+            'totalPnl': round(total_pnl, 2),
+        },
+    }
+
+
 @app.get("/backtest/{strategy}/{ticker}")
 def backtest_results(strategy: str, ticker: str, scenario: str = None):
     conn = sqlite3.connect(DB_PATH)
