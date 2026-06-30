@@ -440,12 +440,12 @@ def backtest_wednesday_es():
 
         # Find first breakout in signal window 9:45–11:00
         signal_bars = day_data.between_time('09:45', '11:00')
-        direction, entry = None, None
-        for _, row in signal_bars.iterrows():
+        direction, entry, entry_idx = None, None, None
+        for idx, row in signal_bars.iterrows():
             if row['high'] > orb_high:
-                direction, entry = 'LONG',  orb_high; break
+                direction, entry, entry_idx = 'LONG',  orb_high, idx; break
             if row['low']  < orb_low:
-                direction, entry = 'SHORT', orb_low;  break
+                direction, entry, entry_idx = 'SHORT', orb_low,  idx; break
 
         if not direction:
             continue
@@ -454,8 +454,10 @@ def backtest_wednesday_es():
         target1 = round(entry + orb_range,        2) if direction == 'LONG' else round(entry - orb_range,        2)
 
         # Simulate Scenario B: C1 exits at T1, C2 exits at EOD; stop exits both
+        # Only evaluate bars from the breakout bar onward — not from 09:45
         all_bars  = day_data.between_time('09:45', '15:55')
         eod_close = float(all_bars['close'].iloc[-1]) if len(all_bars) > 0 else entry
+        all_bars  = all_bars.loc[entry_idx:]
         stop_hit  = False
         t1_hit    = False
 
