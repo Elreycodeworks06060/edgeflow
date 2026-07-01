@@ -421,42 +421,79 @@ def daily_report(ticker: str):
 
 @app.get("/backtest/wednesday/ES")
 def backtest_wednesday_es():
+    from algo_engine import round_tick
+
     df = get_minute_data('ES')
     df = df.between_time('09:30', '16:00')
+
+    conn = sqlite3.connect(DB_PATH)
+    levels_df = pd.read_sql_query("SELECT * FROM key_levels WHERE ticker='ES'", conn)
+    conn.close()
+    levels_df['date'] = pd.to_datetime(levels_df['date']).dt.date
+
     trading_days = df.index.normalize().unique()
     wednesdays   = [d for d in trading_days if d.day_name() == 'Wednesday']
 
-    results = []
+    tick      = 0.25
+    min_range = 8.0
+    results   = []
+
     for day in wednesdays:
         day_data = df[df.index.date == day.date()]
         orb_data = day_data.between_time('09:30', '09:44')
         if len(orb_data) < 5:
             continue
-        orb_high  = float(orb_data['high'].max())
-        orb_low   = float(orb_data['low'].min())
-        orb_range = orb_high - orb_low
-        if orb_range < 8:
+
+        orb_high  = round_tick(orb_data['high'].max(), tick)
+        orb_low   = round_tick(orb_data['low'].min(),  tick)
+        orb_range = round_tick(orb_high - orb_low,     tick)
+        if orb_range < min_range:
             continue
 
-        # Find first breakout in signal window 9:45–11:00
+        day_levels = levels_df[levels_df['date'] == day.date()]
+        if len(day_levels) == 0:
+            continue
+        lev = day_levels.iloc[0]
+
+        # First bar where CLOSE crosses ORB — matches detect_orb_signal() and backtester
         signal_bars = day_data.between_time('09:45', '11:00')
         direction, entry, entry_idx = None, None, None
         for idx, row in signal_bars.iterrows():
-            if row['high'] > orb_high:
-                direction, entry, entry_idx = 'LONG',  orb_high, idx; break
-            if row['low']  < orb_low:
-                direction, entry, entry_idx = 'SHORT', orb_low,  idx; break
+            if row['close'] > orb_high:
+                direction, entry, entry_idx = 'LONG',  round_tick(orb_high, tick), idx; break
+            elif row['close'] < orb_low:
+                direction, entry, entry_idx = 'SHORT', round_tick(orb_low,  tick), idx; break
 
         if not direction:
             continue
 
-        stop    = round(entry - orb_range * 0.5, 2) if direction == 'LONG' else round(entry + orb_range * 0.5, 2)
-        target1 = round(entry + orb_range,        2) if direction == 'LONG' else round(entry - orb_range,        2)
+        # Confluence scoring — mirrors score_confluence_orb() with per-day key_levels
+        score = 0.0
+        if   direction == 'LONG'  and lev['gap_pts'] < 0: score += 2
+        elif direction == 'SHORT' and lev['gap_pts'] > 0: score += 2
+        else: score += 0.5
 
-        # Simulate Scenario B: C1 exits at T1, C2 exits at EOD; stop exits both
-        # Only evaluate bars from the breakout bar onward — not from 09:45
+        if lev['price_above_vwap'] is not None:
+            if (direction == 'LONG'  and     lev['price_above_vwap']) or \
+               (direction == 'SHORT' and not lev['price_above_vwap']):
+                score += 1
+
+        if   direction == 'LONG'  and not lev['pdh_nearby']: score += 1
+        elif direction == 'SHORT' and not lev['pdl_nearby']: score += 1
+
+        # Wednesday never earns Tuesday +0.5 (correct per scoring model)
+        if orb_range > min_range * 1.5: score += 0.5
+
+        if score < 3:
+            continue
+
+        stop    = round_tick(orb_low  if direction == 'LONG' else orb_high, tick)
+        target1 = round_tick(entry + orb_range * 0.5 if direction == 'LONG' else entry - orb_range * 0.5, tick)
+        target2 = round_tick(entry + orb_range       if direction == 'LONG' else entry - orb_range,       tick)
+
+        # Simplified Scenario B: C1 → T1, C2 → EOD; stop exits both before T1
         all_bars  = day_data.between_time('09:45', '15:55')
-        eod_close = float(all_bars['close'].iloc[-1]) if len(all_bars) > 0 else entry
+        eod_close = round_tick(float(all_bars['close'].iloc[-1])) if len(all_bars) > 0 else entry
         all_bars  = all_bars.loc[entry_idx:]
         stop_hit  = False
         t1_hit    = False
@@ -477,35 +514,38 @@ def backtest_wednesday_es():
             pnl    = (stop - entry) * 2 * 50 if direction == 'LONG' else (entry - stop) * 2 * 50
             result = 'loss'
         elif t1_hit:
-            c1 = (target1 - entry) * 50    if direction == 'LONG' else (entry - target1) * 50
-            c2 = (eod_close - entry) * 50  if direction == 'LONG' else (entry - eod_close) * 50
-            pnl    = round(c1 + c2, 2)
+            c1  = (target1   - entry) * 50 if direction == 'LONG' else (entry - target1)   * 50
+            c2  = (eod_close - entry) * 50 if direction == 'LONG' else (entry - eod_close) * 50
+            pnl = round(c1 + c2, 2)
             result = 'win' if pnl > 0 else 'loss'
         else:
             pnl    = (eod_close - entry) * 2 * 50 if direction == 'LONG' else (entry - eod_close) * 2 * 50
             result = 'win' if pnl > 0 else 'loss'
 
         results.append({
-            'date':      str(day.date()),
+            'date':        str(day.date()),
             'day_of_week': 'Wednesday',
-            'direction': direction,
-            'entry':     round(entry, 2),
-            'stop':      round(stop, 2),
-            'target1':   round(target1, 2),
-            'orb_high':  round(orb_high, 2),
-            'orb_low':   round(orb_low,  2),
-            'orb_range': round(orb_range, 2),
-            'pnl':       round(pnl, 2),
-            'result':    result,
-            't1_hit':    t1_hit,
-            'stop_hit':  stop_hit,
-            'eod_close': round(eod_close, 2),
+            'direction':   direction,
+            'entry':       round(entry,     2),
+            'stop':        round(stop,      2),
+            'target1':     round(target1,   2),
+            'target2':     round(target2,   2),
+            'orb_high':    round(orb_high,  2),
+            'orb_low':     round(orb_low,   2),
+            'orb_range':   round(orb_range, 2),
+            'score':       score,
+            'pnl':         round(pnl, 2),
+            'result':      result,
+            't1_hit':      t1_hit,
+            'stop_hit':    stop_hit,
+            'eod_close':   round(eod_close, 2),
+            'gap_pct':     round(float(lev['gap_pct']), 3) if lev['gap_pct'] is not None else None,
         })
 
     if not results:
         return {'trades': [], 'summary': None}
 
-    wins     = [r for r in results if r['result'] == 'win']
+    wins      = [r for r in results if r['result'] == 'win']
     total_pnl = sum(r['pnl'] for r in results)
     return {
         'trades': results,
