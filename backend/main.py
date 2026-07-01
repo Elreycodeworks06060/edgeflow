@@ -491,28 +491,48 @@ def backtest_wednesday_es():
         target1 = round_tick(entry + orb_range * 0.5 if direction == 'LONG' else entry - orb_range * 0.5, tick)
         target2 = round_tick(entry + orb_range       if direction == 'LONG' else entry - orb_range,       tick)
 
-        # Simplified Scenario B: C1 → T1, C2 → EOD; stop exits both before T1
+        # Scenario B — matches simulate_trade_scenario_b() in backtester.py exactly
+        trail_distance = abs(entry - stop) * 0.5
+        current_stop   = stop
         all_bars  = day_data.between_time('09:45', '15:55')
         eod_close = round_tick(float(all_bars['close'].iloc[-1])) if len(all_bars) > 0 else entry
         all_bars  = all_bars.loc[entry_idx:]
-        stop_hit  = False
-        t1_hit    = False
+        pnl      = 0.0
+        stop_hit = False
+        t1_hit   = False
 
         for _, row in all_bars.iterrows():
             if direction == 'LONG':
+                if row['low'] <= current_stop:
+                    if not t1_hit:
+                        pnl = (current_stop - entry) * 2 * 50
+                    else:
+                        pnl = round((target1 - entry) * 50 + (current_stop - entry) * 50, 2)
+                    stop_hit = True; break
                 if not t1_hit and row['high'] >= target1:
-                    t1_hit = True
-                elif not t1_hit and row['low'] <= stop:
+                    t1_hit       = True
+                    current_stop = entry
+                if t1_hit:
+                    new_stop = row['high'] - trail_distance
+                    if new_stop > current_stop:
+                        current_stop = new_stop
+            else:  # SHORT
+                if row['high'] >= current_stop:
+                    if not t1_hit:
+                        pnl = (entry - current_stop) * 2 * 50
+                    else:
+                        pnl = round((entry - target1) * 50 + (entry - current_stop) * 50, 2)
                     stop_hit = True; break
-            else:
                 if not t1_hit and row['low'] <= target1:
-                    t1_hit = True
-                elif not t1_hit and row['high'] >= stop:
-                    stop_hit = True; break
+                    t1_hit       = True
+                    current_stop = entry
+                if t1_hit:
+                    new_stop = row['low'] + trail_distance
+                    if new_stop < current_stop:
+                        current_stop = new_stop
 
         if stop_hit:
-            pnl    = (stop - entry) * 2 * 50 if direction == 'LONG' else (entry - stop) * 2 * 50
-            result = 'loss'
+            result = 'win' if pnl > 0 else 'loss'
         elif t1_hit:
             c1  = (target1   - entry) * 50 if direction == 'LONG' else (entry - target1)   * 50
             c2  = (eod_close - entry) * 50 if direction == 'LONG' else (entry - eod_close) * 50
